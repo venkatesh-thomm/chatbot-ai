@@ -1,0 +1,15 @@
+aws_region   = "us-east-1"
+project_name = "enterprise-rag"
+environment  = "dev"
+vpc_cidr     = "10.20.0.0/16"
+
+eks_cluster_version = "1.36"
+
+# Set your current public IPv4 address as a /32 before provisioning.
+eks_public_access_cidrs = ["203.0.113.10/32"]
+
+# Existing S3 bucket; this Terraform configuration does not create or destroy it.
+s3_documents_bucket = "your-existing-s3-bucket"
+
+# Existing IAM user for local ECR push/OpenSearch development access, or null.
+terraform_iam_user_name = "dev"

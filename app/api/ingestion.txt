@@ -1,0 +1,23 @@
+from fastapi import APIRouter, HTTPException
+from app.models.schemas import IngestionRequest
+from app.services.rag_service import rag_service, ServiceNotConfigured
+
+router = APIRouter(prefix="/api", tags=["ingestion"])
+
+
+@router.post("/load_data", status_code=202)
+def load_data(payload: IngestionRequest):
+    if not any([payload.bucket_name, payload.repository_url]):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide bucket_name for S3 ingestion or repository_url for GitHub ingestion.",
+        )
+    try:
+        return rag_service.ingest(
+            bucket_name=payload.bucket_name,
+            path=payload.path,
+            repository_url=payload.repository_url,
+            branch=payload.branch,
+        )
+    except ServiceNotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
