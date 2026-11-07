@@ -2,6 +2,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.api import chat, evaluation, health, ingestion, media
+from app.api.agent import router as agent_router
+
 
 settings = get_settings()
 app = FastAPI(
@@ -26,6 +28,7 @@ app.include_router(chat.router)
 app.include_router(ingestion.router)
 app.include_router(evaluation.router)
 app.include_router(media.router)
+app.include_router(agent_router)
 
 
 @app.get("/")

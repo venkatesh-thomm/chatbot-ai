@@ -5,3 +5,4 @@ python-multipart>=0.0.9
 boto3>=1.35,<2.0
 langchain-text-splitters>=0.3,<2.0
 opensearch-py>=2.6,<4.0
+langgraph>=0.2,<2.0

@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     s3_documents_bucket: str | None = None
     opensearch_endpoint: str | None = None
     bedrock_embedding_model_id: str = "amazon.titan-embed-text-v2:0"
-    bedrock_llm_model_id: str | None = None
+    bedrock_llm_model_id: str = "us.anthropic.claude-sonnet-4-6"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

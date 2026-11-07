@@ -23,7 +23,13 @@ class ServiceNotConfigured(RuntimeError):
 class RAGService:
 
     def __init__(self):
-        self.vector_indexing = VectorIndexingPipeline()
+        self._vector_indexing = None
+
+    def _get_vector_indexing(self):
+        if self._vector_indexing is None:
+            self._vector_indexing = VectorIndexingPipeline()
+
+        return self._vector_indexing
 
     def answer(
         self,
@@ -101,7 +107,7 @@ class RAGService:
         )
 
         # 4. Index the embeddings in OpenSearch Serverless.
-        indexing_result = self.vector_indexing.index_repository(
+        indexing_result = self._get_vector_indexing().index_repository(
             bucket_name=bucket,
             repository=f"{owner}/{repository}",
             branch=branch,
