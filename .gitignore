@@ -21,3 +21,4 @@ infrastructure/terraform/terraform.tfstate
 infrastructure/terraform/terraform.tfstate.*
 infrastructure/terraform/*.tfplan
 infrastructure/terraform/terraform.tfvars
+infrastructure/terraform/.terraform.lock.hcl
