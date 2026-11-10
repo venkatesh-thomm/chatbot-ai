@@ -2,7 +2,7 @@
 resource "aws_ecr_repository" "api" {
   name                 = "${var.project_name}-${var.environment}-api"
   image_tag_mutability = "IMMUTABLE"
-  force_delete         = false
+  force_delete         = true # Allow deletion of the repository even if it contains images.
 
   image_scanning_configuration {
     scan_on_push = true

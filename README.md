@@ -56,6 +56,7 @@ authenticated agent endpoint. All actions are explicit request values; model
 output cannot choose or authorize a tool. EC2 stop is disabled unless explicitly
 allowlisted and limited to instances matching the configured tag.
 
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 #### Input
 
@@ -143,8 +144,41 @@ pytest -q
 ## Run with Docker
 
 ```bash
-docker build -t enterprise-rag-fastapi:phase1 .
-docker run --rm -p 8000:8000 enterprise-rag-fastapi:phase1
+
+docker build -t enterprise-rag-fastapi:phase1 .```
+
+Now follow these steps to push it to ECR.
+
+### 1. Authenticate with AWS ECR
+
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 210006515453.dkr.ecr.us-east-1.amazonaws.com
+
+
+### 2. Tag your existing image
+
+
+docker tag enterprise-rag-fastapi:phase1 210006515453.dkr.ecr.us-east-1.amazonaws.com/enterprise-rag-dev-api:phase1
+
+
+### 3. Push to ECR
+
+```
+docker push 210006515453.dkr.ecr.us-east-1.amazonaws.com/enterprise-rag-dev-api:phase1
+```
+
+### 4. Verify the image
+
+```
+aws ecr describe-images --repository-name enterprise-rag-dev-api --region us-east-1
+```
+
+Expected image
+
+```
+210006515453.dkr.ecr.us-east-1.amazonaws.com/enterprise-rag-dev-api:phase1
+```
+
+Important: Use the `phase1` tag in your Kubernetes deployment configuration as well. Don't use `latest` unless you have intentionally tagged and pushed that version.docker run --rm -p 8000:8000 enterprise-rag-fastapi:phase1
 ```
 
 ## Endpoint notes

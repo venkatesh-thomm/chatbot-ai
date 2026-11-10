@@ -1,4 +1,3 @@
-
 class DevOpsAnalyzer:
 
     def analyze_runtime_health(
@@ -7,6 +6,7 @@ class DevOpsAnalyzer:
         instances: list[dict] | None = None,
         pods: list[dict] | None = None,
         cloudwatch_metrics: list[dict] | None = None,
+        alb_health: dict | None = None,
     ) -> dict:
         observations = []
         possible_causes = []
@@ -212,6 +212,152 @@ class DevOpsAnalyzer:
                     f"No CloudWatch datapoints were available for {instance_id}."
                 )
 
+        # Application Load Balancer and target health
+        if alb_health is not None:
+            alb_status = alb_health.get("status")
+
+            if alb_status != "completed":
+                evidence_gaps.append(
+                    "ALB investigation could not be completed. "
+                    f"Status: {alb_status or 'unknown'}."
+                )
+
+            else:
+                load_balancers = alb_health.get(
+                    "load_balancers",
+                    [],
+                )
+
+                if not load_balancers:
+                    evidence_gaps.append(
+                        "No Application Load Balancers were found "
+                        "in the configured AWS region."
+                    )
+
+                for load_balancer in load_balancers:
+                    checked_resources += 1
+
+                    lb_name = load_balancer.get(
+                        "name",
+                        "unknown",
+                    )
+                    lb_state = load_balancer.get("state")
+
+                    if lb_state == "active_impaired":
+                        observations.append(
+                            f"Application Load Balancer {lb_name} "
+                            "is in active_impaired state."
+                        )
+
+                        possible_causes.append(
+                            "The load balancer is active but impaired. "
+                            "Inspect its AWS state reason, listeners, "
+                            "target groups, and network configuration."
+                        )
+
+                    elif lb_state == "failed":
+                        observations.append(
+                            f"Application Load Balancer {lb_name} "
+                            "is in failed state."
+                        )
+
+                        possible_causes.append(
+                            "The Application Load Balancer has entered "
+                            "a failed state. Inspect its AWS state reason."
+                        )
+
+                    elif lb_state and lb_state != "active":
+                        evidence_gaps.append(
+                            f"Application Load Balancer {lb_name} "
+                            f"is not yet active (state: {lb_state})."
+                        )
+
+                    if not load_balancer.get("listeners"):
+                        evidence_gaps.append(
+                            f"Application Load Balancer {lb_name} "
+                            "has no listeners."
+                        )
+
+                    target_groups = load_balancer.get(
+                        "target_groups",
+                        [],
+                    )
+
+                    if not target_groups:
+                        evidence_gaps.append(
+                            f"Application Load Balancer {lb_name} "
+                            "has no associated target groups."
+                        )
+
+                    for target_group in target_groups:
+                        checked_resources += 1
+
+                        target_group_name = target_group.get(
+                            "target_group_name",
+                            "unknown",
+                        )
+
+                        targets = target_group.get("targets", [])
+
+                        if not targets:
+                            evidence_gaps.append(
+                                f"Target group {target_group_name} "
+                                "has no registered targets."
+                            )
+
+                        for target in targets:
+                            checked_resources += 1
+
+                            target_id = target.get(
+                                "target_id",
+                                "unknown",
+                            )
+                            target_port = target.get("port")
+                            target_state = target.get(
+                                "state",
+                                "unknown",
+                            )
+                            reason = target.get("reason")
+                            description = target.get("description")
+
+                            target_reference = (
+                                f"{target_id}:{target_port}"
+                                if target_port is not None
+                                else str(target_id)
+                            )
+
+                            if target_state == "unhealthy":
+                                detail = (
+                                    f" Reason: {reason}."
+                                    if reason
+                                    else ""
+                                )
+
+                                if description:
+                                    detail += f" Description: {description}."
+
+                                observations.append(
+                                    f"ALB target {target_reference} in "
+                                    f"target group {target_group_name} "
+                                    f"is unhealthy.{detail}"
+                                )
+
+                                possible_causes.append(
+                                    f"Target group {target_group_name} "
+                                    "has an unhealthy target. Investigate "
+                                    "health-check path, protocol, port, "
+                                    "security groups, network connectivity, "
+                                    "and application availability."
+                                )
+
+                            elif target_state != "healthy":
+                                evidence_gaps.append(
+                                    f"ALB target {target_reference} in "
+                                    f"target group {target_group_name} "
+                                    f"has not reached healthy state "
+                                    f"(state: {target_state})."
+                                )
+
         # Overall diagnosis
         if observations:
             status = "issues_detected"
@@ -230,8 +376,8 @@ class DevOpsAnalyzer:
         else:
             status = "healthy"
             conclusion = (
-                "No unhealthy EC2 or Kubernetes Pod signals were found "
-                "in the inspected resources at check time."
+                "No unhealthy EC2, Kubernetes Pod, or ALB target signals "
+                "were found in the inspected resources at check time."
             )
 
         return {
@@ -240,10 +386,10 @@ class DevOpsAnalyzer:
             "checked_resource_count": checked_resources,
             "observations": observations,
             "possible_causes": list(dict.fromkeys(possible_causes)),
-            "evidence_gaps": evidence_gaps,
+            "evidence_gaps": list(dict.fromkeys(evidence_gaps)),
         }
 
-    # Retained for the ALB integration step.
+    # Retained for existing ALB and CloudWatch findings analysis.
     def _metric_values(self, metric_data: dict) -> list:
         return metric_data.get("datapoints", [])
 

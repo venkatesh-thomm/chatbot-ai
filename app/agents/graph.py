@@ -1,10 +1,10 @@
-
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.agents.planner import DevOpsPlanner
 from app.agents.analyzer import DevOpsAnalyzer
 from app.config import Settings, get_settings
+from app.tools.aws_alb_tool import ALBTool
 from app.tools.aws_cloudwatch_tool import CloudWatchTool
 from app.tools.aws_ec2_tool import EC2Tool
 from app.tools.kubernetes_tool import KubernetesTool
@@ -27,6 +27,7 @@ class DevOpsAgent:
         cloudwatch_tool=None,
         kubernetes_tool=None,
         settings: Settings | None = None,
+        alb_tool=None,
     ):
         self.settings = settings or get_settings()
         self.region = region or self.settings.aws_region
@@ -35,12 +36,14 @@ class DevOpsAgent:
         self.ec2_tool = ec2_tool
         self.cloudwatch_tool = cloudwatch_tool
         self.kubernetes_tool = kubernetes_tool
+        self.alb_tool = alb_tool
 
         self.analyzer = DevOpsAnalyzer()
 
     def _ec2(self) -> EC2Tool:
         if self.ec2_tool is None:
             self.ec2_tool = EC2Tool(region=self.region)
+
         return self.ec2_tool
 
     def _cloudwatch(self) -> CloudWatchTool:
@@ -48,6 +51,7 @@ class DevOpsAgent:
             self.cloudwatch_tool = CloudWatchTool(
                 region=self.region
             )
+
         return self.cloudwatch_tool
 
     def _kubernetes(self) -> KubernetesTool:
@@ -55,7 +59,16 @@ class DevOpsAgent:
             self.kubernetes_tool = KubernetesTool(
                 namespace=self.settings.devops_kubernetes_namespace
             )
+
         return self.kubernetes_tool
+
+    def _alb(self) -> ALBTool:
+        if self.alb_tool is None:
+            self.alb_tool = ALBTool(
+                region=self.region
+            )
+
+        return self.alb_tool
 
     def _validate_scope(
         self,
@@ -95,12 +108,10 @@ class DevOpsAgent:
             },
         }
 
-    def _collect_ec2_health(
-        self,
-        tag_key: str,
-        tag_value: str,
-    ) -> dict:
+    def _collect_ec2_health(self) -> dict:
         try:
+            tag_key, tag_value = self._target_tag()
+
             result = self._ec2().list_instances(
                 tag_key=tag_key,
                 tag_value=tag_value,
@@ -120,6 +131,7 @@ class DevOpsAgent:
                     f"EC2 investigation failed ({type(exc).__name__}). "
                     "Check application logs."
                 ),
+                "instances": [],
             }
 
     def _collect_kubernetes_health(self) -> dict:
@@ -140,6 +152,29 @@ class DevOpsAgent:
                     f"Kubernetes investigation failed "
                     f"({type(exc).__name__}). Check application logs."
                 ),
+                "pods": [],
+            }
+
+    def _collect_alb_health(self) -> dict:
+        try:
+            result = self._alb().inspect_load_balancers()
+
+            return {
+                "status": "completed",
+                **result,
+            }
+
+        except Exception as exc:
+            logger.exception("ALB health investigation failed")
+
+            return {
+                "status": "failed",
+                "error": (
+                    f"ALB investigation failed ({type(exc).__name__}). "
+                    "Check application logs and ELB permissions."
+                ),
+                "load_balancer_count": 0,
+                "load_balancers": [],
             }
 
     def _collect_cloudwatch_instance(
@@ -155,7 +190,7 @@ class DevOpsAgent:
             return {
                 "instance_id": instance_id,
                 "status": "completed",
-                "metrics": result["metrics"],
+                "metrics": result.get("metrics", {}),
             }
 
         except Exception as exc:
@@ -168,6 +203,7 @@ class DevOpsAgent:
                 "instance_id": instance_id,
                 "status": "failed",
                 "error": type(exc).__name__,
+                "metrics": {},
             }
 
     def _collect_cloudwatch_health(
@@ -187,7 +223,25 @@ class DevOpsAgent:
                 "instance_metrics": [],
             }
 
-        cloudwatch = self._cloudwatch()
+        try:
+            cloudwatch = self._cloudwatch()
+        except Exception as exc:
+            logger.exception("CloudWatch client initialization failed")
+
+            return {
+                "status": "failed",
+                "reason": f"CloudWatch initialization failed ({type(exc).__name__}).",
+                "instance_metrics": [
+                    {
+                        "instance_id": instance_id,
+                        "status": "failed",
+                        "error": type(exc).__name__,
+                        "metrics": {},
+                    }
+                    for instance_id in instance_ids
+                ],
+            }
+
         results = []
 
         with ThreadPoolExecutor(
@@ -229,29 +283,28 @@ class DevOpsAgent:
         }
 
     def _check_health_parallel(self) -> dict:
-        tag_key, tag_value = self._target_tag()
-
-        # EC2 and Kubernetes are independent investigations.
+        # EC2, Kubernetes, and ALB investigations are independent.
         with ThreadPoolExecutor(
-            max_workers=2,
+            max_workers=3,
             thread_name_prefix="devops-investigation",
         ) as executor:
 
             ec2_future = executor.submit(
                 self._collect_ec2_health,
-                tag_key,
-                tag_value,
             )
 
             kubernetes_future = executor.submit(
                 self._collect_kubernetes_health,
             )
 
-            # Wait for EC2 inventory. Kubernetes continues independently.
+            alb_future = executor.submit(
+                self._collect_alb_health,
+            )
+
+            # Start CloudWatch after EC2 inventory is available.
             ec2_result = ec2_future.result()
 
             if ec2_result["status"] == "completed":
-                # CloudWatch runs while Kubernetes investigation is in progress.
                 cloudwatch_result = self._collect_cloudwatch_health(
                     ec2_result.get("instances", [])
                 )
@@ -263,6 +316,7 @@ class DevOpsAgent:
                 }
 
             kubernetes_result = kubernetes_future.result()
+            alb_result = alb_future.result()
 
         instances = ec2_result.get("instances", [])
         pods = kubernetes_result.get("pods", [])
@@ -271,8 +325,10 @@ class DevOpsAgent:
             instances=instances,
             pods=pods,
             cloudwatch_metrics=cloudwatch_result.get(
-                "instance_metrics", []
+                "instance_metrics",
+                [],
             ),
+            alb_health=alb_result,
         )
 
         # Empty inventories are not proof that infrastructure is healthy.
@@ -297,25 +353,40 @@ class DevOpsAgent:
                 "Some CloudWatch metrics could not be collected."
             )
 
-        if diagnosis["status"] == "healthy" and diagnosis["evidence_gaps"]:
+        diagnosis["evidence_gaps"] = list(
+            dict.fromkeys(diagnosis["evidence_gaps"])
+        )
+
+        if (
+            diagnosis["status"] == "healthy"
+            and diagnosis["evidence_gaps"]
+        ):
             diagnosis["status"] = "insufficient_evidence"
             diagnosis["conclusion"] = (
                 "No unhealthy signal was confirmed, but some "
                 "infrastructure evidence is incomplete."
             )
 
-        successful_investigations = sum([
-            ec2_result["status"] == "completed",
-            kubernetes_result["status"] == "completed",
-        ])
+        investigation_statuses = [
+            ec2_result["status"],
+            kubernetes_result["status"],
+            alb_result["status"],
+        ]
+
+        successful_investigations = sum(
+            status == "completed"
+            for status in investigation_statuses
+        )
 
         if successful_investigations == 0:
             execution_status = "failed"
+
         elif (
-            successful_investigations == 2
+            successful_investigations == len(investigation_statuses)
             and cloudwatch_result["status"] in {"completed", "skipped"}
         ):
             execution_status = "completed"
+
         else:
             execution_status = "partial"
 
@@ -324,11 +395,13 @@ class DevOpsAgent:
                 "Investigation partially completed. "
                 + diagnosis["conclusion"]
             )
+
         elif execution_status == "failed":
             summary = (
                 "Infrastructure investigation failed. "
                 "Check the service logs for details."
             )
+
         else:
             summary = diagnosis["conclusion"]
 
@@ -352,11 +425,17 @@ class DevOpsAgent:
                     "action": "get_instance_health_metrics",
                     "status": cloudwatch_result["status"],
                 },
+                {
+                    "tool": "alb",
+                    "action": "inspect_load_balancers",
+                    "status": alb_result["status"],
+                },
             ],
             "output": {
                 "ec2": ec2_result,
                 "kubernetes": kubernetes_result,
                 "cloudwatch": cloudwatch_result,
+                "alb": alb_result,
                 "diagnosis": diagnosis,
             },
         }
