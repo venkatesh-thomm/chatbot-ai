@@ -1,10 +1,8 @@
-
 #!/bin/bash
 set -Eeuo pipefail
 
 # ==========================================
-# DevOps AI Agent - Full Infrastructure Deployment
-# Terraform + Docker + AWS ECR + EKS
+# DevOps AI Agent - Full Deployment
 # ==========================================
 
 REGION="us-east-1"
@@ -30,7 +28,7 @@ echo "=========================================="
 # STEP 1: Check required tools
 # ------------------------------------------
 
-echo "[1/12] Checking required tools..."
+echo "[1/10] Checking required tools..."
 
 for tool in aws terraform kubectl helm docker; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -39,23 +37,26 @@ for tool in aws terraform kubectl helm docker; do
     }
 done
 
-# Check Terraform variables file
-if [ ! -f "$TF_DIR/$TF_VARS" ]; then
-    echo "ERROR: $TF_DIR/$TF_VARS not found."
-    exit 1
-fi
-
-# Check Dockerfile
 if [ ! -f "Dockerfile" ]; then
-    echo "ERROR: Dockerfile not found in project root."
+    echo "ERROR: Dockerfile not found."
     exit 1
 fi
 
+if [ ! -f "$TF_DIR/$TF_VARS" ]; then
+    echo "ERROR: terraform.tfvars not found."
+    exit 1
+fi
+
+docker info >/dev/null 2>&1 || {
+    echo "ERROR: Docker daemon is not running."
+    exit 1
+}
+
 # ------------------------------------------
-# STEP 2: Verify AWS identity
+# STEP 2: Verify AWS identity and ECR
 # ------------------------------------------
 
-echo "[2/12] Verifying AWS credentials..."
+echo "[2/10] Verifying AWS credentials..."
 
 aws sts get-caller-identity
 
@@ -67,55 +68,101 @@ if [ "$CURRENT_ACCOUNT" != "$ACCOUNT_ID" ]; then
     exit 1
 fi
 
+echo "Checking existing ECR repository..."
+
+aws ecr describe-repositories \
+    --repository-names "$ECR_REPOSITORY" \
+    --region "$REGION" >/dev/null
+
 # ------------------------------------------
-# STEP 3: Initialize Terraform
+# STEP 3: Docker build, tag and push
 # ------------------------------------------
 
-echo "[3/12] Initializing Terraform..."
+echo "[3/10] Authenticating Docker with ECR..."
+
+aws ecr get-login-password \
+    --region "$REGION" | \
+docker login \
+    --username AWS \
+    --password-stdin "$ECR_URI"
+
+echo "Building FastAPI Docker image..."
+
+docker build \
+    -t "${LOCAL_IMAGE}:${IMAGE_TAG}" .
+
+echo "Tagging Docker image..."
+
+docker tag \
+    "${LOCAL_IMAGE}:${IMAGE_TAG}" \
+    "$REMOTE_IMAGE"
+
+echo "Pushing Docker image to ECR..."
+
+docker push "$REMOTE_IMAGE"
+
+echo "Verifying ECR image..."
+
+aws ecr describe-images \
+    --repository-name "$ECR_REPOSITORY" \
+    --region "$REGION" \
+    --image-ids "imageTag=${IMAGE_TAG}"
+
+echo "Docker image successfully pushed:"
+echo "$REMOTE_IMAGE"
+
+
+
+# ------------------------------------------
+# STEP 9: Update Helm repositories
+# ------------------------------------------
+
+echo "[9/10] Updating Helm repositories..."
+
+helm repo update
+
+
+# ------------------------------------------
+# STEP 4: Initialize Terraform
+# ------------------------------------------
+
+echo "[4/10] Initializing Terraform..."
 
 terraform -chdir="$TF_DIR" init
 
 # ------------------------------------------
-# STEP 4: Format and validate Terraform
+# STEP 5: Format and validate Terraform
 # ------------------------------------------
 
-echo "[4/12] Formatting and validating Terraform..."
+echo "[5/10] Formatting and validating Terraform..."
 
 terraform -chdir="$TF_DIR" fmt -recursive
 
 terraform -chdir="$TF_DIR" validate
 
 # ------------------------------------------
-# STEP 5: Check and import existing ECR
+# STEP 6: Import existing ECR if necessary
 # ------------------------------------------
 
-echo "[5/12] Checking ECR repository..."
+echo "[6/10] Checking Terraform ECR state..."
 
-if aws ecr describe-repositories \
-    --repository-names "$ECR_REPOSITORY" \
-    --region "$REGION" >/dev/null 2>&1; then
+if ! terraform -chdir="$TF_DIR" state show \
+    aws_ecr_repository.api >/dev/null 2>&1; then
 
-    if ! terraform -chdir="$TF_DIR" state show \
-        aws_ecr_repository.api >/dev/null 2>&1; then
+    echo "Importing existing ECR repository..."
 
-        echo "Importing existing ECR repository..."
-
-        terraform -chdir="$TF_DIR" import \
-            -var-file="$TF_VARS" \
-            aws_ecr_repository.api "$ECR_REPOSITORY"
-    else
-        echo "ECR repository already managed by Terraform."
-    fi
+    terraform -chdir="$TF_DIR" import \
+        -var-file="$TF_VARS" \
+        aws_ecr_repository.api "$ECR_REPOSITORY"
 else
-    echo "ECR repository does not exist."
-    echo "Terraform will create it."
+    echo "ECR repository already managed by Terraform."
 fi
 
 # ------------------------------------------
-# STEP 6: Apply ONLY ECR resource
+# STEP 7: Apply ONLY ECR
 # ------------------------------------------
 
-echo "[6/12] Applying ECR repository only..."
+echo "[7/10] Applying ECR repository only..."
 
 terraform -chdir="$TF_DIR" plan \
     -var-file="$TF_VARS" \
@@ -124,59 +171,11 @@ terraform -chdir="$TF_DIR" plan \
 
 terraform -chdir="$TF_DIR" apply ecr.tfplan
 
-echo "ECR repository is ready."
-
 # ------------------------------------------
-# STEP 7: Authenticate Docker with ECR
+# STEP 8: Verify EKS connectivity
 # ------------------------------------------
 
-echo "[7/12] Authenticating Docker with AWS ECR..."
-
-aws ecr get-login-password \
-    --region "$REGION" | \
-docker login \
-    --username AWS \
-    --password-stdin "$ECR_URI"
-
-# ------------------------------------------
-# STEP 8: Build Docker image
-# ------------------------------------------
-
-echo "[8/12] Building FastAPI Docker image..."
-
-docker build \
-    -t "${LOCAL_IMAGE}:${IMAGE_TAG}" .
-
-# ------------------------------------------
-# STEP 9: Tag Docker image
-# ------------------------------------------
-
-echo "[9/12] Tagging Docker image..."
-
-docker tag \
-    "${LOCAL_IMAGE}:${IMAGE_TAG}" \
-    "$REMOTE_IMAGE"
-
-# ------------------------------------------
-# STEP 10: Push Docker image to ECR
-# ------------------------------------------
-
-echo "[10/12] Pushing Docker image to ECR..."
-
-docker push "$REMOTE_IMAGE"
-
-echo "Verifying image in ECR..."
-
-aws ecr describe-images \
-    --repository-name "$ECR_REPOSITORY" \
-    --region "$REGION" \
-    --image-ids "imageTag=${IMAGE_TAG}"
-
-# ------------------------------------------
-# STEP 11: Verify EKS and Kubernetes
-# ------------------------------------------
-
-echo "[11/12] Checking EKS cluster..."
+echo "[8/10] Checking EKS cluster..."
 
 CLUSTER_STATUS=$(aws eks describe-cluster \
     --name "$CLUSTER_NAME" \
@@ -197,21 +196,16 @@ aws eks update-kubeconfig \
     --region "$REGION" \
     --name "$CLUSTER_NAME"
 
-echo "Checking Kubernetes connectivity..."
+echo "Verifying Kubernetes connectivity..."
 
 kubectl cluster-info
-
 kubectl get nodes
 
 # ------------------------------------------
-# STEP 12: Apply remaining infrastructure
+# STEP 10: Full Terraform deployment
 # ------------------------------------------
 
-echo "[12/12] Updating Helm repositories..."
-
-helm repo update
-
-echo "Creating complete Terraform plan..."
+echo "[10/10] Creating complete Terraform plan..."
 
 terraform -chdir="$TF_DIR" plan \
     -var-file="$TF_VARS" \
@@ -229,8 +223,6 @@ if [ "$CONFIRM" != "yes" ]; then
     exit 0
 fi
 
-echo "Applying remaining infrastructure..."
-
 terraform -chdir="$TF_DIR" apply tfplan
 
 # ------------------------------------------
@@ -242,7 +234,7 @@ echo "=========================================="
 echo " Deployment Completed"
 echo "=========================================="
 
-echo "Docker image:"
+echo "Docker Image:"
 echo "$REMOTE_IMAGE"
 
 echo ""
