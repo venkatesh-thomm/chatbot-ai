@@ -1,3 +1,4 @@
+
 class DevOpsAnalyzer:
 
     def analyze_runtime_health(
@@ -5,135 +6,233 @@ class DevOpsAnalyzer:
         *,
         instances: list[dict] | None = None,
         pods: list[dict] | None = None,
+        cloudwatch_metrics: list[dict] | None = None,
     ) -> dict:
-        """Explain unhealthy signals from observed EC2 and pod status only."""
         observations = []
         possible_causes = []
         evidence_gaps = []
         checked_resources = 0
 
+        # EC2 instance health
         for instance in instances or []:
             checked_resources += 1
+
             instance_id = instance.get("instance_id", "unknown")
             state = instance.get("state", "unknown")
 
             if state != "running":
                 reason = instance.get("state_reason")
+
                 observations.append(
                     f"EC2 instance {instance_id} is {state}."
                     + (f" AWS reports: {reason}" if reason else "")
                 )
+
                 possible_causes.append(
-                    "The instance is not running. Its state reason may indicate "
-                    "whether it was stopped by a user, an AWS event, or a failure; "
-                    "check CloudTrail and the EC2 console for more detail."
+                    "The EC2 instance is not running. Inspect its state "
+                    "reason and relevant AWS events."
                 )
 
             checks = instance.get("status_checks") or {}
+
             if not checks:
                 evidence_gaps.append(
-                    f"EC2 status checks were unavailable for {instance_id}."
+                    f"EC2 status checks unavailable for {instance_id}."
                 )
-            for check_name in ("instance_status", "system_status"):
+
+            for check_name in (
+                "instance_status",
+                "system_status",
+            ):
                 check_status = checks.get(check_name)
+
                 if check_status == "impaired":
                     observations.append(
-                        f"EC2 instance {instance_id} {check_name.replace('_', ' ')} "
-                        f"is {check_status}."
+                        f"EC2 {instance_id}: "
+                        f"{check_name.replace('_', ' ')} is impaired."
                     )
+
                     possible_causes.append(
-                        "An EC2 status check is impaired or still initializing. "
-                        "Inspect the EC2 status-check details and system log."
+                        "An EC2 instance or system status check is impaired. "
+                        "Investigate instance health and AWS infrastructure."
                     )
+
                 elif check_status == "initializing":
                     evidence_gaps.append(
-                        f"EC2 {check_name.replace('_', ' ')} for {instance_id} "
+                        f"EC2 {check_name} for {instance_id} "
                         "is still initializing."
                     )
+
                 elif check_status not in {"ok", "not-applicable"}:
                     evidence_gaps.append(
-                        f"EC2 {check_name.replace('_', ' ')} for {instance_id} "
+                        f"EC2 {check_name} for {instance_id} "
                         "did not return a definitive status."
                     )
 
             for event in checks.get("events", []):
                 observations.append(
-                    f"EC2 instance {instance_id} has scheduled event "
+                    f"EC2 {instance_id} has scheduled event "
                     f"{event.get('code') or 'unknown'}: "
                     f"{event.get('description') or 'description unavailable'}."
                 )
 
+        # Kubernetes Pod health
         for pod in pods or []:
             checked_resources += 1
+
             pod_name = pod.get("name", "unknown")
             namespace = pod.get("namespace", "unknown")
+            phase = pod.get("phase", "Unknown")
 
-            if pod.get("phase") == "Failed":
+            if phase == "Failed":
                 observations.append(
                     f"Pod {namespace}/{pod_name} is in Failed phase."
                 )
+
                 possible_causes.append(
-                    "The pod terminated unsuccessfully. Inspect its container "
-                    "termination reason and Kubernetes events."
-                )
-            elif pod.get("phase") != "Succeeded" and not pod.get("ready", False):
-                observations.append(
-                    f"Pod {namespace}/{pod_name} is not ready "
-                    f"(phase: {pod.get('phase', 'Unknown')})."
-                )
-                possible_causes.append(
-                    "The pod may be waiting for scheduling, image retrieval, "
-                    "container startup, or a readiness probe."
+                    "The Kubernetes Pod terminated unsuccessfully. "
+                    "Inspect container termination reason and events."
                 )
 
-            if pod.get("restart_count", 0) > 0:
+            elif phase != "Succeeded" and not pod.get("ready", False):
+                observations.append(
+                    f"Pod {namespace}/{pod_name} is not ready "
+                    f"(phase: {phase})."
+                )
+
+                possible_causes.append(
+                    "The Pod may have scheduling, image pull, startup, "
+                    "or readiness-probe problems."
+                )
+
+            restart_count = pod.get("restart_count", 0)
+
+            if restart_count > 0:
                 observations.append(
                     f"Pod {namespace}/{pod_name} has restarted "
-                    f"{pod['restart_count']} time(s)."
+                    f"{restart_count} time(s)."
                 )
+
                 possible_causes.append(
-                    "Container restarts can result from crashes, failed probes, "
-                    "resource limits, or node issues; inspect container logs and "
-                    "events to identify the cause."
+                    "Container restarts can result from application crashes, "
+                    "failed probes, resource limits, or node issues."
                 )
 
             for container in pod.get("containers", []):
                 reason = container.get("reason")
+
                 if reason:
                     observations.append(
-                        f"Container {container.get('name', 'unknown')} in "
-                        f"{namespace}/{pod_name} reports {reason}."
+                        f"Container {container.get('name', 'unknown')} "
+                        f"in {namespace}/{pod_name} reports {reason}."
                     )
 
             for event in pod.get("warning_events", []):
                 if event.get("reason") or event.get("message"):
                     observations.append(
                         f"Kubernetes warning for {namespace}/{pod_name}: "
-                        f"{event.get('reason') or 'Warning'} — "
+                        f"{event.get('reason') or 'Warning'} - "
                         f"{event.get('message') or 'message unavailable'}."
                     )
 
+        # CloudWatch EC2 metrics
+        for item in cloudwatch_metrics or []:
+            instance_id = item.get("instance_id", "unknown")
+
+            if item.get("status") != "completed":
+                evidence_gaps.append(
+                    f"CloudWatch metrics unavailable for {instance_id}."
+                )
+                continue
+
+            metrics = item.get("metrics", {})
+            has_datapoints = False
+
+            cpu_points = metrics.get(
+                "CPUUtilization", {}
+            ).get("datapoints", [])
+
+            cpu_values = [
+                point["maximum"]
+                for point in cpu_points
+                if point.get("maximum") is not None
+            ]
+
+            if cpu_values:
+                has_datapoints = True
+                maximum_cpu = max(cpu_values)
+
+                if maximum_cpu >= 80:
+                    observations.append(
+                        f"EC2 {instance_id} CPU utilization "
+                        f"reached {maximum_cpu}%."
+                    )
+
+                    possible_causes.append(
+                        f"EC2 instance {instance_id} has high CPU utilization. "
+                        "Investigate workload and application resource consumption."
+                    )
+
+            status_metrics = [
+                "StatusCheckFailed",
+                "StatusCheckFailed_Instance",
+                "StatusCheckFailed_System",
+            ]
+
+            for metric_name in status_metrics:
+                points = metrics.get(
+                    metric_name, {}
+                ).get("datapoints", [])
+
+                values = [
+                    point["maximum"]
+                    for point in points
+                    if point.get("maximum") is not None
+                ]
+
+                if not values:
+                    continue
+
+                has_datapoints = True
+                maximum = max(values)
+
+                if maximum > 0:
+                    observations.append(
+                        f"EC2 {instance_id}: {metric_name} "
+                        f"reached {maximum}."
+                    )
+
+                    possible_causes.append(
+                        f"EC2 instance {instance_id} reported {metric_name}. "
+                        "Investigate EC2 status-check details."
+                    )
+
+            if not has_datapoints:
+                evidence_gaps.append(
+                    f"No CloudWatch datapoints were available for {instance_id}."
+                )
+
+        # Overall diagnosis
         if observations:
             status = "issues_detected"
             conclusion = (
-                "The following unhealthy signals were observed. Possible causes "
-                "are investigative leads, not a confirmed root cause."
+                "Unhealthy infrastructure signals were observed. "
+                "Possible causes are investigative leads, not a confirmed root cause."
             )
+
         elif evidence_gaps or not checked_resources:
             status = "insufficient_evidence"
             conclusion = (
-                "No unhealthy signal was confirmed, but the available health "
-                "evidence is incomplete."
+                "No unhealthy signal was confirmed, but the available "
+                "infrastructure evidence is incomplete."
             )
-        elif checked_resources:
+
+        else:
             status = "healthy"
             conclusion = (
-                "No unhealthy EC2 or pod signals were found in the inspected "
-                "resources at check time."
+                "No unhealthy EC2 or Kubernetes Pod signals were found "
+                "in the inspected resources at check time."
             )
-        else:
-            status = "insufficient_evidence"
-            conclusion = "No EC2 instances or Kubernetes pods were available to inspect."
 
         return {
             "status": status,
@@ -144,6 +243,7 @@ class DevOpsAnalyzer:
             "evidence_gaps": evidence_gaps,
         }
 
+    # Retained for the ALB integration step.
     def _metric_values(self, metric_data: dict) -> list:
         return metric_data.get("datapoints", [])
 
@@ -153,6 +253,7 @@ class DevOpsAnalyzer:
             for point in self._metric_values(metric_data)
             if point.get("maximum") is not None
         ]
+
         return max(values) if values else None
 
     def _total(self, metric_data: dict):
@@ -161,6 +262,7 @@ class DevOpsAnalyzer:
             for point in self._metric_values(metric_data)
             if point.get("sum") is not None
         ]
+
         return sum(values) if values else None
 
     def analyze(self, findings: list) -> dict:
@@ -174,48 +276,48 @@ class DevOpsAnalyzer:
 
             for group in target_groups:
                 for target in group.get("targets", []):
-                    state = target.get("state")
-
-                    if state == "unhealthy":
+                    if target.get("state") == "unhealthy":
                         evidence_available = True
+
                         observations.append(
                             f"Target {target.get('target_id')} in "
                             f"{group.get('target_group_name')} is unhealthy. "
                             f"Reason: {target.get('reason') or 'Not provided'}."
                         )
+
                         likely_causes.append(
                             "One or more ALB targets are unhealthy. "
-                            "Investigate application health checks, "
-                            "target port, security groups and application availability."
+                            "Investigate health checks, target ports, "
+                            "security groups and application availability."
                         )
 
             for entry in item.get("cloudwatch_alb_metrics", []):
                 metrics = entry.get("metrics", {})
 
-                for metric_name in [
+                for metric_name in (
                     "HTTPCode_ELB_5XX_Count",
                     "HTTPCode_Target_5XX_Count",
-                ]:
-                    metric = metrics.get(metric_name, {})
-                    total = self._total(metric)
+                ):
+                    total = self._total(metrics.get(metric_name, {}))
 
                     if total is not None:
                         evidence_available = True
 
                     if total is not None and total > 0:
                         observations.append(
-                            f"{metric_name}: {total} errors during the "
-                            "available CloudWatch observation period."
+                            f"{metric_name}: {total} errors during "
+                            "the available CloudWatch observation period."
                         )
+
                         likely_causes.append(
                             f"{metric_name} is greater than zero. "
-                            "Investigate the corresponding load balancer "
-                            "or backend target errors."
+                            "Investigate load balancer or backend target errors."
                         )
 
                 unhealthy = self._maximum(
                     metrics.get("UnHealthyHostCount", {})
                 )
+
                 healthy = self._maximum(
                     metrics.get("HealthyHostCount", {})
                 )
@@ -227,9 +329,9 @@ class DevOpsAnalyzer:
                     observations.append(
                         f"Unhealthy target count reached {unhealthy}."
                     )
+
                     likely_causes.append(
-                        "Unhealthy targets may be contributing to "
-                        "request failures."
+                        "Unhealthy targets may contribute to request failures."
                     )
 
                 if healthy is not None:
@@ -239,6 +341,7 @@ class DevOpsAnalyzer:
                     observations.append(
                         "Healthy target count reached zero."
                     )
+
                     likely_causes.append(
                         "No healthy targets were available for the load balancer."
                     )
@@ -254,6 +357,7 @@ class DevOpsAnalyzer:
                     observations.append(
                         f"Target response time reached {response_time} seconds."
                     )
+
                     likely_causes.append(
                         "Backend response latency is elevated. "
                         "Investigate application performance and dependencies."
@@ -263,11 +367,11 @@ class DevOpsAnalyzer:
                 instance_id = entry.get("instance_id")
                 metrics = entry.get("metrics", {})
 
-                for metric_name in [
+                for metric_name in (
                     "StatusCheckFailed",
                     "StatusCheckFailed_Instance",
                     "StatusCheckFailed_System",
-                ]:
+                ):
                     maximum = self._maximum(
                         metrics.get(metric_name, {})
                     )
@@ -277,13 +381,13 @@ class DevOpsAnalyzer:
 
                     if maximum is not None and maximum > 0:
                         observations.append(
-                            f"EC2 {instance_id}: {metric_name} reached "
-                            f"{maximum}."
+                            f"EC2 {instance_id}: {metric_name} "
+                            f"reached {maximum}."
                         )
+
                         likely_causes.append(
                             f"EC2 instance {instance_id} has a failed "
-                            "status check. Investigate instance or "
-                            "underlying AWS infrastructure health."
+                            "status check."
                         )
 
                 cpu = self._maximum(
@@ -295,14 +399,13 @@ class DevOpsAnalyzer:
 
                 if cpu is not None and cpu >= 80:
                     observations.append(
-                        f"EC2 {instance_id}: CPU utilization reached "
-                        f"{cpu}%."
+                        f"EC2 {instance_id}: CPU utilization reached {cpu}%."
                     )
+
                     likely_causes.append(
                         f"EC2 instance {instance_id} has high CPU utilization."
                     )
 
-        # Remove duplicate causes while preserving order.
         likely_causes = list(dict.fromkeys(likely_causes))
 
         if not evidence_available:
@@ -311,13 +414,14 @@ class DevOpsAnalyzer:
                 "No usable CloudWatch metric datapoints or target-health "
                 "evidence were available. Root cause cannot yet be determined."
             )
+
         elif likely_causes:
             status = "potential_issues_detected"
             conclusion = (
                 "Potential infrastructure or backend issues were detected. "
-                "The findings are evidence-based indicators, not a confirmed "
-                "root cause."
+                "These are evidence-based indicators, not a confirmed root cause."
             )
+
         else:
             status = "no_obvious_issue_detected"
             conclusion = (
