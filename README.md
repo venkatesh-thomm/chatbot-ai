@@ -57,14 +57,16 @@ output cannot choose or authorize a tool. EC2 stop is disabled unless explicitly
 allowlisted and limited to instances matching the configured tag.
 
 
+``` 
+
 {
   "prompt": "Check EC2 and Kubernetes health",
   "action": "plan",
   "environment": "development",
   "region": "us-east-1"
 }
-
-
+```
+```
 {
   "prompt": "Check CPU usage",
   "action": "get_instance_cpu",
@@ -72,7 +74,7 @@ allowlisted and limited to instances matching the configured tag.
   "region": "us-east-1",
   "target_instance_id": "i-4d6Abf4d4Fb34"
 }
-
+```
 ## Continuous monitoring
 
 The Kubernetes CronJob runs a one-shot, read-only check every five minutes:
