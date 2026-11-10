@@ -1,10 +1,12 @@
+
 import logging
+import time
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from app.agents.graph import DevOpsAgent
-
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +23,24 @@ class AgentRequest(BaseModel):
 
 
 @router.post("/investigate")
-def investigate(request: AgentRequest):
-
+async def investigate(request: AgentRequest):
+    started_at = time.perf_counter()
+    logger.info(
+    "Investigation started | Request: %s",
+     request.request,
+    )
     try:
-        result = agent.run(request.request)
+        result = await run_in_threadpool(
+            agent.run,
+            request.request,
+        )
+
+        elapsed = time.perf_counter() - started_at
+        
+        logger.info(
+            "DevOps investigation completed in %.2f seconds",
+            elapsed,
+        )
 
         return {
             "status": result.get("status"),
@@ -36,18 +52,20 @@ def investigate(request: AgentRequest):
             "required_tools": result.get("required_tools"),
             "risk_level": result.get("risk_level"),
             "findings": result.get("findings", []),
+            "analysis": result.get("analysis"),
+            "execution_time_seconds": round(elapsed, 2),
         }
 
     except ValueError as exc:
+        logger.warning("Invalid DevOps request: %s", exc)
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         )
 
-    except Exception as exc:
+    except Exception:
         logger.exception("DevOps agent investigation failed")
-
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="DevOps investigation failed. Check application logs.",
         )

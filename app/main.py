@@ -4,6 +4,10 @@ from app.config import get_settings
 from app.api import chat, evaluation, health, ingestion, media
 from app.api.agent import router as agent_router
 
+from app.core.logging_config import setup_logging
+
+setup_logging()
+
 
 settings = get_settings()
 app = FastAPI(

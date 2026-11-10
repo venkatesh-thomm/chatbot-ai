@@ -4,6 +4,8 @@ from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 
 from app.agents.planner import DevOpsPlanner
+from app.agents.analyzer import DevOpsAnalyzer
+
 from app.tools.aws_ec2_tool import AWSEC2ReadOnlyTool
 from app.tools.aws_alb_tool import AWSALBReadOnlyTool
 from app.tools.aws_cloudwatch_tool import AWSCloudWatchReadOnlyTool
@@ -17,6 +19,7 @@ class AgentState(TypedDict, total=False):
     risk_level: str
     findings: list
     response: str
+    analysis: dict
     status: str
 
 
@@ -24,6 +27,8 @@ class DevOpsAgent:
 
     def __init__(self, planner=None):
         self.planner = planner or DevOpsPlanner()
+        self.analyzer = DevOpsAnalyzer()
+
         self.ec2_tool = AWSEC2ReadOnlyTool()
         self.alb_tool = AWSALBReadOnlyTool()
         self.cloudwatch_tool = AWSCloudWatchReadOnlyTool()
@@ -33,6 +38,7 @@ class DevOpsAgent:
         workflow.add_node("planner", self.planner_node)
         workflow.add_node("alb_investigator", self.alb_investigator)
         workflow.add_node("ec2_investigator", self.ec2_investigator)
+        workflow.add_node("analyzer", self.analyzer_node)
 
         workflow.add_edge(START, "planner")
 
@@ -51,11 +57,12 @@ class DevOpsAgent:
             self.route_after_alb,
             {
                 "ec2": "ec2_investigator",
-                "end": END,
+                "analyzer": "analyzer",
             },
         )
 
-        workflow.add_edge("ec2_investigator", END)
+        workflow.add_edge("ec2_investigator", "analyzer")
+        workflow.add_edge("analyzer", END)
 
         self.graph = workflow.compile()
 
@@ -75,7 +82,10 @@ class DevOpsAgent:
     def route_after_planner(self, state: AgentState) -> str:
         request = state["request"].lower()
 
-        if re.search(r"\b502\b|\b503\b|\bbad gateway\b", request):
+        if re.search(
+            r"\b502\b|\b503\b|\bbad gateway\b",
+            request,
+        ):
             return "alb"
 
         if re.search(
@@ -101,7 +111,7 @@ class DevOpsAgent:
         ):
             return "ec2"
 
-        return "end"
+        return "analyzer"
 
     def alb_investigator(self, state: AgentState) -> dict:
         alb_findings = self.alb_tool.inspect_load_balancers(
@@ -119,7 +129,8 @@ class DevOpsAgent:
             groups = [
                 group
                 for group in alb_findings.get("target_groups", [])
-                if group.get("load_balancer_name") == lb.get("LoadBalancerName")
+                if group.get("load_balancer_name")
+                == lb.get("LoadBalancerName")
             ]
 
             if not groups:
@@ -137,7 +148,7 @@ class DevOpsAgent:
                     "target_group": group.get("target_group_name"),
                     "metrics": self.cloudwatch_tool.inspect_alb_metrics(
                         lb_arn,
-                        group.get("TargetGroupArn"),
+                        group.get("target_group_arn"),
                     ),
                 })
 
@@ -175,6 +186,19 @@ class DevOpsAgent:
                     "ec2": ec2_findings,
                     "cloudwatch_ec2_metrics": cloudwatch_findings,
                 }
+            ],
+            "status": "ec2_investigation_completed",
+        }
+
+    def analyzer_node(self, state: AgentState) -> dict:
+        analysis = self.analyzer.analyze(
+            state.get("findings", [])
+        )
+
+        return {
+            "analysis": analysis,
+            "findings": state.get("findings", []) + [
+                {"root_cause_analysis": analysis}
             ],
             "status": "investigation_completed",
         }

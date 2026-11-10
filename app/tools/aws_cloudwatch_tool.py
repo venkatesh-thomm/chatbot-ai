@@ -4,6 +4,18 @@ import boto3
 
 from app.config import get_settings
 
+from botocore.config import Config
+
+aws_config = Config(
+    connect_timeout=3,
+    read_timeout=10,
+    retries={
+        "max_attempts": 2,
+        "mode": "standard"
+    }
+)
+
+
 
 class AWSCloudWatchReadOnlyTool:
     def __init__(self):

@@ -2,8 +2,20 @@ import boto3
 
 from app.config import get_settings
 
+from botocore.config import Config
+
+aws_config = Config(
+    connect_timeout=3,
+    read_timeout=10,
+    retries={
+        "max_attempts": 2,
+        "mode": "standard"
+    }
+)
+
 
 class AWSALBReadOnlyTool:
+
     def __init__(self):
         settings = get_settings()
         self.region = settings.aws_region
@@ -17,11 +29,14 @@ class AWSALBReadOnlyTool:
         load_balancers = []
         target_groups = []
 
-        paginator = self.client.get_paginator("describe_load_balancers")
+        paginator = self.client.get_paginator(
+            "describe_load_balancers"
+        )
 
         for page in paginator.paginate():
-            for lb in page.get("LoadBalancers", []):
-                load_balancers.append(lb)
+            load_balancers.extend(
+                page.get("LoadBalancers", [])
+            )
 
         for lb in load_balancers:
             listeners = self.client.describe_listeners(
@@ -32,6 +47,17 @@ class AWSALBReadOnlyTool:
                 LoadBalancerArn=lb["LoadBalancerArn"]
             ).get("TargetGroups", [])
 
+            lb["Listeners"] = [
+                {
+                    "port": listener.get("Port"),
+                    "protocol": listener.get("Protocol"),
+                    "default_actions": listener.get(
+                        "DefaultActions", []
+                    ),
+                }
+                for listener in listeners
+            ]
+
             for group in groups:
                 health = self.client.describe_target_health(
                     TargetGroupArn=group["TargetGroupArn"]
@@ -39,6 +65,7 @@ class AWSALBReadOnlyTool:
 
                 target_groups.append({
                     "load_balancer_name": lb["LoadBalancerName"],
+                    "target_group_arn": group["TargetGroupArn"],
                     "target_group_name": group["TargetGroupName"],
                     "protocol": group.get("Protocol"),
                     "port": group.get("Port"),
@@ -60,15 +87,6 @@ class AWSALBReadOnlyTool:
                         for item in health
                     ],
                 })
-
-            lb["Listeners"] = [
-                {
-                    "port": listener.get("Port"),
-                    "protocol": listener.get("Protocol"),
-                    "default_actions": listener.get("DefaultActions", []),
-                }
-                for listener in listeners
-            ]
 
         return {
             "tool": "aws_alb_read_only",
