@@ -29,6 +29,7 @@ resource "aws_iam_role" "app" {
 }
 
 data "aws_iam_policy_document" "app_permissions" {
+
   statement {
     sid       = "PublishDevOpsHealthAlerts"
     effect    = "Allow"
@@ -39,20 +40,51 @@ data "aws_iam_policy_document" "app_permissions" {
   statement {
     sid    = "PersistDevOpsMonitorState"
     effect = "Allow"
+
     actions = [
       "dynamodb:GetItem",
       "dynamodb:PutItem"
     ]
+
     resources = [aws_dynamodb_table.devops_monitor_state.arn]
   }
 
   statement {
     sid    = "ReadEC2Health"
     effect = "Allow"
+
     actions = [
       "ec2:DescribeInstances",
       "ec2:DescribeInstanceStatus"
     ]
+
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "ReadCloudWatchMetrics"
+    effect = "Allow"
+
+    actions = [
+      "cloudwatch:GetMetricStatistics",
+      "cloudwatch:GetMetricData",
+      "cloudwatch:DescribeAlarms"
+    ]
+
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "ReadApplicationLoadBalancerHealth"
+    effect = "Allow"
+
+    actions = [
+      "elasticloadbalancing:DescribeLoadBalancers",
+      "elasticloadbalancing:DescribeListeners",
+      "elasticloadbalancing:DescribeTargetGroups",
+      "elasticloadbalancing:DescribeTargetHealth"
+    ]
+
     resources = ["*"]
   }
 
@@ -87,6 +119,7 @@ data "aws_iam_policy_document" "app_permissions" {
     sid     = "InvokeTitanEmbeddings"
     effect  = "Allow"
     actions = ["bedrock:InvokeModel"]
+
     resources = [
       "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.bedrock_embedding_model_id}"
     ]
