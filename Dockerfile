@@ -11,6 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+RUN mkdir -p /app/logs && chown app:app /app/logs
 USER app
 EXPOSE 8000
 

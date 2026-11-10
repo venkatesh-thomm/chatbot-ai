@@ -1,12 +1,14 @@
-from typing import TypedDict, Any
+from dataclasses import dataclass, field
+from typing import Any
 
 
-class DevOpsAgentState(TypedDict, total=False):
-    request: str
-    category: str
-    investigation_plan: list[str]
-    required_tools: list[str]
-    risk_level: str
-    findings: list[dict[str, Any]]
-    response: str
-    status: str
+@dataclass
+class AgentState:
+    prompt: str
+    environment: str = "prod"
+    region: str | None = None
+    intent: str = ""
+    summary: str = ""
+    tool_calls: list[dict] = field(default_factory=list)
+    output: dict = field(default_factory=dict)
+    error: str | None = None

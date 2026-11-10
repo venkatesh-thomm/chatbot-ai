@@ -30,6 +30,33 @@ resource "aws_iam_role" "app" {
 
 data "aws_iam_policy_document" "app_permissions" {
   statement {
+    sid       = "PublishDevOpsHealthAlerts"
+    effect    = "Allow"
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.devops_agent_alerts.arn]
+  }
+
+  statement {
+    sid    = "PersistDevOpsMonitorState"
+    effect = "Allow"
+    actions = [
+      "dynamodb:GetItem",
+      "dynamodb:PutItem"
+    ]
+    resources = [aws_dynamodb_table.devops_monitor_state.arn]
+  }
+
+  statement {
+    sid    = "ReadEC2Health"
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeInstances",
+      "ec2:DescribeInstanceStatus"
+    ]
+    resources = ["*"]
+  }
+
+  statement {
     sid       = "ListRepositoryDocuments"
     effect    = "Allow"
     actions   = ["s3:ListBucket"]
@@ -73,6 +100,21 @@ data "aws_iam_policy_document" "app_permissions" {
   }
 }
 
+resource "aws_sns_topic" "devops_agent_alerts" {
+  name = "${var.project_name}-${var.environment}-devops-alerts"
+}
+
+resource "aws_dynamodb_table" "devops_monitor_state" {
+  name         = "${var.project_name}-${var.environment}-devops-monitor-state"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "monitor_id"
+
+  attribute {
+    name = "monitor_id"
+    type = "S"
+  }
+}
+
 resource "aws_iam_role_policy" "app" {
   name   = "${var.project_name}-${var.environment}-api-permissions"
   role   = aws_iam_role.app.id
@@ -81,4 +123,14 @@ resource "aws_iam_role_policy" "app" {
 
 output "app_irsa_role_arn" {
   value = aws_iam_role.app.arn
+}
+
+output "devops_alerts_sns_topic_arn" {
+  description = "SNS topic ARN for DevOps monitor notifications"
+  value       = aws_sns_topic.devops_agent_alerts.arn
+}
+
+output "devops_monitor_state_table_name" {
+  description = "DynamoDB table used to suppress repeated DevOps monitor alerts"
+  value       = aws_dynamodb_table.devops_monitor_state.name
 }
