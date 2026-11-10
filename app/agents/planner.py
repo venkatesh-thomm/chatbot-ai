@@ -4,10 +4,19 @@ from app.agents.prompts import DEVOPS_AGENT_SYSTEM_PROMPT
 from app.services.gemini_service import GeminiService
 
 
+class PlannerNotConfigured(RuntimeError):
+    """Raised when the planner's model client cannot be initialized."""
+
+
 class DevOpsPlanner:
 
     def __init__(self, gemini_service=None):
-        self.gemini = gemini_service or GeminiService()
+        try:
+            self.gemini = gemini_service or GeminiService()
+        except ValueError as exc:
+            raise PlannerNotConfigured(
+                "Configure GEMINI_API_KEY to enable DevOps planning."
+            ) from exc
 
     def create_plan(self, request: str) -> dict:
 

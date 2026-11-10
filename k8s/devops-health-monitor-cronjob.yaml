@@ -1,0 +1,48 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: devops-health-monitor
+  namespace: default
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 180
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 240
+      template:
+        spec:
+          serviceAccountName: enterprise-rag-api
+          restartPolicy: Never
+          containers:
+            - name: health-monitor
+              image: REPLACE_WITH_ECR_IMAGE_URI
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "app.monitoring.run"]
+              env:
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: ENVIRONMENT
+                  value: "development"
+                - name: DEVOPS_ALLOWED_ENVIRONMENT
+                  value: "development"
+                - name: DEVOPS_KUBERNETES_NAMESPACE
+                  value: "default"
+                - name: DEVOPS_TARGET_TAG_KEY
+                  value: "REPLACE_WITH_INSTANCE_TAG_KEY"
+                - name: DEVOPS_TARGET_TAG_VALUE
+                  value: "REPLACE_WITH_INSTANCE_TAG_VALUE"
+                - name: DEVOPS_ALERTS_SNS_TOPIC_ARN
+                  value: "REPLACE_WITH_TERRAFORM_SNS_TOPIC_ARN"
+                - name: DEVOPS_MONITOR_STATE_TABLE
+                  value: "REPLACE_WITH_TERRAFORM_STATE_TABLE_NAME"
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
