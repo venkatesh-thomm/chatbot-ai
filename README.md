@@ -57,7 +57,7 @@ output cannot choose or authorize a tool. EC2 stop is disabled unless explicitly
 allowlisted and limited to instances matching the configured tag.
 
 
-``` 
+``` json
 
 {
   "prompt": "Check EC2 and Kubernetes health",
@@ -65,8 +65,8 @@ allowlisted and limited to instances matching the configured tag.
   "environment": "development",
   "region": "us-east-1"
 }
-```
-```
+
+
 {
   "prompt": "Check CPU usage",
   "action": "get_instance_cpu",
