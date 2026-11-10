@@ -16,6 +16,7 @@ The AWS provider can create the VPC and EKS cluster before a Kubernetes API exis
 Run these commands from the repository root in Git Bash:
 
 ```bash
+helm repo update
 terraform -chdir=infrastructure/terraform init
 terraform -chdir=infrastructure/terraform fmt -recursive
 terraform -chdir=infrastructure/terraform validate

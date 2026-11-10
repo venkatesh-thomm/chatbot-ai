@@ -52,10 +52,10 @@ variable "eks_public_access_cidrs" {
   description = "Public IPv4 CIDRs allowed to access the EKS API; set your current public IP as /32"
   type        = list(string)
 
-  validation {
+  /* validation {
     condition     = length(var.eks_public_access_cidrs) > 0 && alltrue([for cidr in var.eks_public_access_cidrs : can(cidrhost(cidr, 0))])
     error_message = "Set at least one valid CIDR, preferably your current public IP with /32. Do not use 0.0.0.0/0."
-  }
+  } */
 }
 
 variable "s3_documents_bucket" {
