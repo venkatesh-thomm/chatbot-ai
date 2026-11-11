@@ -37,6 +37,86 @@ class DevOpsAnalyzer:
 
         return values
 
+    def _analyze_cloudwatch_alarms(
+        self,
+        alarms: list[dict] | None,
+        observations: list[str],
+        possible_causes: list[str],
+        evidence_gaps: list[str],
+    ) -> None:
+        for alarm in alarms or []:
+            alarm_name = alarm.get("alarm_name") or "unnamed alarm"
+            state = alarm.get("state_value")
+            state_reason = alarm.get("state_reason")
+            metric_name = alarm.get("metric_name")
+            threshold = alarm.get("threshold")
+            comparison = alarm.get("comparison_operator")
+
+            dimensions = alarm.get("dimensions", [])
+
+            dimension_summary = ", ".join(
+                f"{item.get('name')}={item.get('value')}"
+                for item in dimensions
+                if item.get("name") and item.get("value")
+            )
+
+            details = []
+
+            if metric_name:
+                details.append(f"Metric: {metric_name}")
+
+            if comparison and threshold is not None:
+                details.append(
+                    f"Condition: {comparison} {threshold}"
+                )
+
+            if dimension_summary:
+                details.append(
+                    f"Resource dimensions: {dimension_summary}"
+                )
+
+            detail_text = (
+                " " + "; ".join(details) + "."
+                if details
+                else ""
+            )
+
+            if state == "ALARM":
+                reason_text = (
+                    f" AWS reason: {state_reason}."
+                    if state_reason
+                    else ""
+                )
+
+                observations.append(
+                    f"CloudWatch alarm {alarm_name} is in ALARM state."
+                    f"{detail_text}{reason_text}"
+                )
+
+                possible_causes.append(
+                    f"CloudWatch alarm {alarm_name} entered ALARM state. "
+                    "Inspect its underlying metric, affected resource, "
+                    "recent metric datapoints, and related application "
+                    "or infrastructure events. The alarm alone does not "
+                    "confirm the root cause."
+                )
+
+            elif state == "INSUFFICIENT_DATA":
+                evidence_gaps.append(
+                    f"CloudWatch alarm {alarm_name} is in "
+                    "INSUFFICIENT_DATA state."
+                    f"{detail_text}"
+                )
+
+            elif state == "OK":
+                continue
+
+            else:
+                evidence_gaps.append(
+                    f"CloudWatch alarm {alarm_name} returned "
+                    f"an unknown or missing state: {state or 'unknown'}."
+                )
+
     def analyze_runtime_health(
         self,
         *,
@@ -45,6 +125,7 @@ class DevOpsAnalyzer:
         cloudwatch_metrics: list[dict] | None = None,
         alb_health: dict | None = None,
         cloudwatch_alb_metrics: list[dict] | None = None,
+        cloudwatch_alarms: list[dict] | None = None,
     ) -> dict:
         observations = []
         possible_causes = []
@@ -191,6 +272,8 @@ class DevOpsAnalyzer:
                 )
 
             metrics = item.get("metrics", {})
+            instance_values = {}
+
             metric_definitions = [
                 ("CPUUtilization", "maximum"),
                 ("StatusCheckFailed", "maximum"),
@@ -198,33 +281,28 @@ class DevOpsAnalyzer:
                 ("StatusCheckFailed_System", "maximum"),
             ]
 
-            instance_values = {}
-
             for metric_name, statistic in metric_definitions:
-                values = self._extract_metric_values(
-                    metric_data=metrics.get(metric_name, {}),
-                    statistic=statistic,
-                    metric_label=f"EC2 {instance_id} {metric_name}",
-                    evidence_gaps=evidence_gaps,
+                instance_values[metric_name] = (
+                    self._extract_metric_values(
+                        metric_data=metrics.get(metric_name, {}),
+                        statistic=statistic,
+                        metric_label=f"EC2 {instance_id} {metric_name}",
+                        evidence_gaps=evidence_gaps,
+                    )
                 )
-
-                instance_values[metric_name] = values
 
             cpu_values = instance_values["CPUUtilization"]
 
-            if cpu_values:
-                maximum_cpu = max(cpu_values)
+            if cpu_values and max(cpu_values) >= 80:
+                observations.append(
+                    f"EC2 {instance_id} CPU utilization "
+                    f"reached {max(cpu_values)}%."
+                )
 
-                if maximum_cpu >= 80:
-                    observations.append(
-                        f"EC2 {instance_id} CPU utilization "
-                        f"reached {maximum_cpu}%."
-                    )
-
-                    possible_causes.append(
-                        f"EC2 instance {instance_id} has high CPU utilization. "
-                        "Investigate workload and application resource consumption."
-                    )
+                possible_causes.append(
+                    f"EC2 instance {instance_id} has high CPU utilization. "
+                    "Investigate workload and application resource consumption."
+                )
 
             for metric_name in (
                 "StatusCheckFailed",
@@ -269,10 +347,7 @@ class DevOpsAnalyzer:
                 for load_balancer in load_balancers:
                     checked_resources += 1
 
-                    lb_name = load_balancer.get(
-                        "name",
-                        "unknown",
-                    )
+                    lb_name = load_balancer.get("name", "unknown")
                     lb_state = load_balancer.get("state")
 
                     if lb_state == "active_impaired":
@@ -340,15 +415,9 @@ class DevOpsAnalyzer:
                         for target in targets:
                             checked_resources += 1
 
-                            target_id = target.get(
-                                "target_id",
-                                "unknown",
-                            )
+                            target_id = target.get("target_id", "unknown")
                             target_port = target.get("port")
-                            target_state = target.get(
-                                "state",
-                                "unknown",
-                            )
+                            target_state = target.get("state", "unknown")
                             reason = target.get("reason")
                             description = target.get("description")
 
@@ -392,10 +461,7 @@ class DevOpsAnalyzer:
 
         # CloudWatch Application Load Balancer metrics
         for item in cloudwatch_alb_metrics or []:
-            lb_name = item.get(
-                "load_balancer_name",
-                "unknown",
-            )
+            lb_name = item.get("load_balancer_name", "unknown")
             item_status = item.get("status")
 
             if item_status not in {"completed", "partial"}:
@@ -410,11 +476,7 @@ class DevOpsAnalyzer:
                     f"for {lb_name}."
                 )
 
-            # Load-balancer-level metrics
-            lb_metrics = item.get(
-                "load_balancer_metrics",
-                {},
-            )
+            lb_metrics = item.get("load_balancer_metrics", {})
 
             elb_5xx = self._extract_metric_values(
                 metric_data=lb_metrics.get(
@@ -440,7 +502,6 @@ class DevOpsAnalyzer:
                     "capacity, and backend connectivity."
                 )
 
-            # Target-group-level metrics
             for target_group in item.get(
                 "target_group_metrics",
                 [],
@@ -449,7 +510,6 @@ class DevOpsAnalyzer:
                     "target_group_name",
                     "unknown",
                 )
-
                 metrics = target_group.get("metrics", {})
 
                 target_5xx = self._extract_metric_values(
@@ -466,11 +526,9 @@ class DevOpsAnalyzer:
                 )
 
                 if target_5xx and sum(target_5xx) > 0:
-                    total_errors = sum(target_5xx)
-
                     observations.append(
                         f"Target group {target_group_name} generated "
-                        f"{total_errors} backend HTTP 5XX errors."
+                        f"{sum(target_5xx)} backend HTTP 5XX errors."
                     )
 
                     possible_causes.append(
@@ -549,10 +607,18 @@ class DevOpsAnalyzer:
                         "targets. Review target-health reasons and health checks."
                     )
 
-        # Overall diagnosis
+        # CloudWatch alarm states
+        self._analyze_cloudwatch_alarms(
+            alarms=cloudwatch_alarms,
+            observations=observations,
+            possible_causes=possible_causes,
+            evidence_gaps=evidence_gaps,
+        )
+
         evidence_gaps = list(dict.fromkeys(evidence_gaps))
         possible_causes = list(dict.fromkeys(possible_causes))
 
+        # Overall diagnosis
         if observations:
             status = "issues_detected"
             conclusion = (
@@ -570,9 +636,9 @@ class DevOpsAnalyzer:
         else:
             status = "healthy"
             conclusion = (
-                "No unhealthy EC2, Kubernetes Pod, ALB target, or "
-                "CloudWatch ALB metric signals were found in the inspected "
-                "resources at check time."
+                "No unhealthy EC2, Kubernetes Pod, ALB target, "
+                "CloudWatch metric, or alarm signals were found "
+                "in the inspected resources at check time."
             )
 
         return {
