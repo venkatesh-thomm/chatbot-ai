@@ -288,18 +288,6 @@ class CloudWatchTool:
         target_groups: list[dict] | None = None,
         period: int = 60,
     ) -> dict:
-        """
-        Collect Application Load Balancer and target-group metrics.
-
-        Load-balancer metric:
-          - HTTPCode_ELB_5XX_Count
-
-        Target-group metrics:
-          - HTTPCode_Target_5XX_Count
-          - TargetResponseTime
-          - HealthyHostCount
-          - UnHealthyHostCount
-        """
         self._validate_period(period)
 
         load_balancer_dimension = self._arn_dimension_value(
@@ -312,7 +300,6 @@ class CloudWatchTool:
         queries = []
         query_metadata = {}
 
-        # Load-balancer-level 5XX errors.
         queries.append({
             "Id": "elb_5xx",
             "MetricStat": {
@@ -410,9 +397,7 @@ class CloudWatchTool:
 
         result = self._execute_metric_queries(
             queries,
-            operation_name=(
-                f"ALB metrics for {load_balancer_dimension}"
-            ),
+            operation_name=f"ALB metrics for {load_balancer_dimension}",
         )
 
         load_balancer_metrics = {}
@@ -448,15 +433,198 @@ class CloudWatchTool:
             ),
         }
 
-    def get_alarms(self) -> dict:
-        try:
-            response = self.client.describe_alarms()
+    @staticmethod
+    def _alarm_timestamp(value):
+        return value.isoformat() if hasattr(value, "isoformat") else value
 
-            return {
-                "alarms": response.get("MetricAlarms", [])
-            }
+    @staticmethod
+    def _build_alarm_scope(
+        instance_ids: list[str] | None,
+        load_balancers: list[dict] | None,
+    ) -> dict[str, set[str]]:
+        scope = {
+            "InstanceId": set(instance_ids or []),
+            "LoadBalancer": set(),
+            "TargetGroup": set(),
+        }
+
+        for load_balancer in load_balancers or []:
+            load_balancer_arn = load_balancer.get("load_balancer_arn")
+
+            if load_balancer_arn:
+                scope["LoadBalancer"].add(
+                    CloudWatchTool._arn_dimension_value(
+                        load_balancer_arn,
+                        "loadbalancer/",
+                    )
+                )
+
+            for target_group in load_balancer.get("target_groups", []):
+                target_group_arn = target_group.get("target_group_arn")
+
+                if target_group_arn:
+                    scope["TargetGroup"].add(
+                        CloudWatchTool._arn_dimension_value(
+                            target_group_arn,
+                            "targetgroup/",
+                        )
+                    )
+
+        return scope
+
+    @staticmethod
+    def _alarm_matches_scope(
+        alarm: dict,
+        scope: dict[str, set[str]],
+    ) -> bool:
+        dimensions = alarm.get("Dimensions", [])
+
+        relevant_dimensions = [
+            dimension
+            for dimension in dimensions
+            if dimension.get("Name") in scope
+            and scope[dimension["Name"]]
+        ]
+
+        if not relevant_dimensions:
+            return False
+
+        # Every recognized resource dimension must belong to this run's scope.
+        return all(
+            dimension.get("Value") in scope[dimension["Name"]]
+            for dimension in relevant_dimensions
+        )
+
+    @staticmethod
+    def _normalize_alarm(alarm: dict) -> dict:
+        return {
+            "alarm_name": alarm.get("AlarmName"),
+            "alarm_arn": alarm.get("AlarmArn"),
+            "alarm_description": alarm.get("AlarmDescription"),
+            "state_value": alarm.get("StateValue"),
+            "state_reason": alarm.get("StateReason"),
+            "state_updated_timestamp": CloudWatchTool._alarm_timestamp(
+                alarm.get("StateUpdatedTimestamp")
+            ),
+            "namespace": alarm.get("Namespace"),
+            "metric_name": alarm.get("MetricName"),
+            "dimensions": [
+                {
+                    "name": dimension.get("Name"),
+                    "value": dimension.get("Value"),
+                }
+                for dimension in alarm.get("Dimensions", [])
+            ],
+            "comparison_operator": alarm.get("ComparisonOperator"),
+            "threshold": alarm.get("Threshold"),
+            "evaluation_periods": alarm.get("EvaluationPeriods"),
+            "datapoints_to_alarm": alarm.get("DatapointsToAlarm"),
+            "period": alarm.get("Period"),
+            "statistic": alarm.get("Statistic"),
+            "extended_statistic": alarm.get("ExtendedStatistic"),
+            "treat_missing_data": alarm.get("TreatMissingData"),
+            "actions_enabled": alarm.get("ActionsEnabled"),
+        }
+
+    def get_alarms(
+        self,
+        instance_ids: list[str] | None = None,
+        load_balancers: list[dict] | None = None,
+    ) -> dict:
+        """
+        Retrieve metric alarms, optionally limited to discovered resources.
+
+        When resource identifiers are supplied, only alarms whose recognized
+        EC2 or ALB dimensions match the investigation scope are returned.
+        Composite alarms are intentionally not included because they do not
+        expose resource dimensions suitable for this direct matching.
+        """
+        scoped = instance_ids is not None or load_balancers is not None
+
+        scope = self._build_alarm_scope(
+            instance_ids=instance_ids,
+            load_balancers=load_balancers,
+        )
+
+        alarms = []
+        next_token = None
+        seen_tokens = set()
+
+        try:
+            while True:
+                request = {
+                    "AlarmTypes": ["MetricAlarm"],
+                    "MaxRecords": 100,
+                }
+
+                if next_token:
+                    request["NextToken"] = next_token
+
+                response = self.client.describe_alarms(**request)
+
+                alarms.extend(
+                    response.get("MetricAlarms", [])
+                )
+
+                next_token = response.get("NextToken")
+
+                if not next_token:
+                    break
+
+                if next_token in seen_tokens:
+                    raise RuntimeError(
+                        "CloudWatch returned a repeated alarm pagination token."
+                    )
+
+                seen_tokens.add(next_token)
 
         except (ClientError, BotoCoreError) as exc:
             raise RuntimeError(
                 f"CloudWatch alarm retrieval failed: {type(exc).__name__}"
             ) from exc
+
+        if scoped:
+            alarms = [
+                alarm
+                for alarm in alarms
+                if self._alarm_matches_scope(alarm, scope)
+            ]
+
+        normalized_alarms = [
+            self._normalize_alarm(alarm)
+            for alarm in alarms
+        ]
+
+        normalized_alarms.sort(
+            key=lambda alarm: (
+                {
+                    "ALARM": 0,
+                    "INSUFFICIENT_DATA": 1,
+                    "OK": 2,
+                }.get(alarm.get("state_value"), 3),
+                alarm.get("alarm_name") or "",
+            )
+        )
+
+        state_counts = {
+            "ALARM": 0,
+            "INSUFFICIENT_DATA": 0,
+            "OK": 0,
+            "OTHER": 0,
+        }
+
+        for alarm in normalized_alarms:
+            state = alarm.get("state_value")
+
+            if state in state_counts:
+                state_counts[state] += 1
+            else:
+                state_counts["OTHER"] += 1
+
+        return {
+            "status": "completed",
+            "scoped": scoped,
+            "alarm_count": len(normalized_alarms),
+            "state_counts": state_counts,
+            "alarms": normalized_alarms,
+        }
