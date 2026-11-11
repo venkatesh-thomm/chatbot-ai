@@ -178,6 +178,24 @@ class DevOpsAgent:
                 "load_balancers": [],
             }
 
+    @staticmethod
+    def _aggregate_status(results: list[dict]) -> str:
+        if not results:
+            return "skipped"
+
+        statuses = [
+            item.get("status", "failed")
+            for item in results
+        ]
+
+        if all(status == "completed" for status in statuses):
+            return "completed"
+
+        if all(status == "failed" for status in statuses):
+            return "failed"
+
+        return "partial"
+
     def _collect_cloudwatch_instance(
         self,
         cloudwatch: CloudWatchTool,
@@ -211,24 +229,6 @@ class DevOpsAgent:
                 "error": type(exc).__name__,
                 "metrics": {},
             }
-
-    @staticmethod
-    def _aggregate_status(results: list[dict]) -> str:
-        if not results:
-            return "skipped"
-
-        statuses = [
-            item.get("status", "failed")
-            for item in results
-        ]
-
-        if all(status == "completed" for status in statuses):
-            return "completed"
-
-        if all(status == "failed" for status in statuses):
-            return "failed"
-
-        return "partial"
 
     def _collect_cloudwatch_health(
         self,
@@ -411,6 +411,53 @@ class DevOpsAgent:
             "load_balancers": results,
         }
 
+    def _collect_cloudwatch_alarms(
+        self,
+        instances: list[dict],
+        alb_result: dict,
+    ) -> dict:
+        """
+        Retrieve CloudWatch alarms associated with discovered EC2 and ALB
+        resources. The CloudWatch tool performs the dimension-based filtering.
+        """
+        instance_ids = [
+            instance["instance_id"]
+            for instance in instances
+            if instance.get("instance_id")
+        ]
+
+        load_balancers = (
+            alb_result.get("load_balancers", [])
+            if alb_result.get("status") == "completed"
+            else []
+        )
+
+        try:
+            result = self._cloudwatch().get_alarms(
+                instance_ids=instance_ids,
+                load_balancers=load_balancers,
+            )
+
+            return {
+                "status": result.get("status", "failed"),
+                "scoped": result.get("scoped", True),
+                "alarm_count": result.get("alarm_count", 0),
+                "state_counts": result.get("state_counts", {}),
+                "alarms": result.get("alarms", []),
+            }
+
+        except Exception as exc:
+            logger.exception("CloudWatch alarm investigation failed")
+
+            return {
+                "status": "failed",
+                "scoped": True,
+                "alarm_count": 0,
+                "state_counts": {},
+                "alarms": [],
+                "error": type(exc).__name__,
+            }
+
     def _check_health_parallel(self) -> dict:
         # EC2, Kubernetes, and ALB discovery are independent.
         with ThreadPoolExecutor(
@@ -432,7 +479,6 @@ class DevOpsAgent:
 
             ec2_result = ec2_future.result()
 
-            # Collect EC2 CloudWatch metrics while other investigations run.
             if ec2_result["status"] == "completed":
                 cloudwatch_result = self._collect_cloudwatch_health(
                     ec2_result.get("instances", [])
@@ -447,13 +493,18 @@ class DevOpsAgent:
             kubernetes_result = kubernetes_future.result()
             alb_result = alb_future.result()
 
-        # ALB CloudWatch metrics require discovered ALB and target-group ARNs.
         cloudwatch_alb_result = self._collect_cloudwatch_alb_health(
             alb_result
         )
 
         instances = ec2_result.get("instances", [])
         pods = kubernetes_result.get("pods", [])
+
+        # Alarm collection uses the EC2 and ALB inventory already discovered.
+        cloudwatch_alarms_result = self._collect_cloudwatch_alarms(
+            instances=instances,
+            alb_result=alb_result,
+        )
 
         diagnosis = self.analyzer.analyze_runtime_health(
             instances=instances,
@@ -465,6 +516,10 @@ class DevOpsAgent:
             alb_health=alb_result,
             cloudwatch_alb_metrics=cloudwatch_alb_result.get(
                 "load_balancers",
+                [],
+            ),
+            cloudwatch_alarms=cloudwatch_alarms_result.get(
+                "alarms",
                 [],
             ),
         )
@@ -495,6 +550,11 @@ class DevOpsAgent:
                 "Some ALB CloudWatch metrics could not be collected completely."
             )
 
+        if cloudwatch_alarms_result["status"] in {"failed", "partial"}:
+            diagnosis["evidence_gaps"].append(
+                "CloudWatch alarm investigation could not be completed completely."
+            )
+
         diagnosis["evidence_gaps"] = list(
             dict.fromkeys(diagnosis["evidence_gaps"])
         )
@@ -523,6 +583,7 @@ class DevOpsAgent:
         cloudwatch_statuses = [
             cloudwatch_result["status"],
             cloudwatch_alb_result["status"],
+            cloudwatch_alarms_result["status"],
         ]
 
         cloudwatch_complete = all(
@@ -587,6 +648,11 @@ class DevOpsAgent:
                     "action": "get_alb_metrics",
                     "status": cloudwatch_alb_result["status"],
                 },
+                {
+                    "tool": "cloudwatch",
+                    "action": "get_alarms",
+                    "status": cloudwatch_alarms_result["status"],
+                },
             ],
             "output": {
                 "ec2": ec2_result,
@@ -594,6 +660,7 @@ class DevOpsAgent:
                 "cloudwatch": cloudwatch_result,
                 "alb": alb_result,
                 "cloudwatch_alb": cloudwatch_alb_result,
+                "cloudwatch_alarms": cloudwatch_alarms_result,
                 "diagnosis": diagnosis,
             },
         }
