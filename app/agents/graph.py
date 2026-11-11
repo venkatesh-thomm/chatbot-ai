@@ -1,3 +1,4 @@
+
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -187,15 +188,20 @@ class DevOpsAgent:
                 instance_id
             )
 
+            status = result.get("status", "failed")
+
+            if status not in {"completed", "partial", "failed"}:
+                status = "failed"
+
             return {
                 "instance_id": instance_id,
-                "status": "completed",
+                "status": status,
                 "metrics": result.get("metrics", {}),
             }
 
         except Exception as exc:
             logger.exception(
-                "CloudWatch investigation failed for %s",
+                "CloudWatch EC2 metrics failed for %s",
                 instance_id,
             )
 
@@ -205,6 +211,24 @@ class DevOpsAgent:
                 "error": type(exc).__name__,
                 "metrics": {},
             }
+
+    @staticmethod
+    def _aggregate_status(results: list[dict]) -> str:
+        if not results:
+            return "skipped"
+
+        statuses = [
+            item.get("status", "failed")
+            for item in results
+        ]
+
+        if all(status == "completed" for status in statuses):
+            return "completed"
+
+        if all(status == "failed" for status in statuses):
+            return "failed"
+
+        return "partial"
 
     def _collect_cloudwatch_health(
         self,
@@ -225,12 +249,16 @@ class DevOpsAgent:
 
         try:
             cloudwatch = self._cloudwatch()
+
         except Exception as exc:
             logger.exception("CloudWatch client initialization failed")
 
             return {
                 "status": "failed",
-                "reason": f"CloudWatch initialization failed ({type(exc).__name__}).",
+                "reason": (
+                    f"CloudWatch initialization failed "
+                    f"({type(exc).__name__})."
+                ),
                 "instance_metrics": [
                     {
                         "instance_id": instance_id,
@@ -246,7 +274,7 @@ class DevOpsAgent:
 
         with ThreadPoolExecutor(
             max_workers=min(4, len(instance_ids)),
-            thread_name_prefix="cloudwatch",
+            thread_name_prefix="cloudwatch-ec2",
         ) as executor:
 
             futures = {
@@ -265,25 +293,126 @@ class DevOpsAgent:
             key=lambda item: item["instance_id"]
         )
 
-        failed_count = sum(
-            item["status"] == "failed"
-            for item in results
-        )
-
-        if failed_count == 0:
-            status = "completed"
-        elif failed_count == len(results):
-            status = "failed"
-        else:
-            status = "partial"
-
         return {
-            "status": status,
+            "status": self._aggregate_status(results),
             "instance_metrics": results,
         }
 
+    def _collect_cloudwatch_alb_instance(
+        self,
+        cloudwatch: CloudWatchTool,
+        load_balancer: dict,
+    ) -> dict:
+        load_balancer_arn = load_balancer["load_balancer_arn"]
+        load_balancer_name = load_balancer.get("name", "unknown")
+
+        try:
+            result = cloudwatch.get_alb_metrics(
+                load_balancer_arn=load_balancer_arn,
+                target_groups=load_balancer.get("target_groups", []),
+            )
+
+            status = result.get("status", "failed")
+
+            if status not in {"completed", "partial", "failed"}:
+                status = "failed"
+
+            return {
+                "load_balancer_arn": load_balancer_arn,
+                "load_balancer_name": load_balancer_name,
+                "status": status,
+                "load_balancer_metrics": result.get(
+                    "load_balancer_metrics",
+                    {},
+                ),
+                "target_group_metrics": result.get(
+                    "target_group_metrics",
+                    [],
+                ),
+            }
+
+        except Exception as exc:
+            logger.exception(
+                "CloudWatch ALB metrics failed for %s",
+                load_balancer_name,
+            )
+
+            return {
+                "load_balancer_arn": load_balancer_arn,
+                "load_balancer_name": load_balancer_name,
+                "status": "failed",
+                "error": type(exc).__name__,
+                "load_balancer_metrics": {},
+                "target_group_metrics": [],
+            }
+
+    def _collect_cloudwatch_alb_health(
+        self,
+        alb_result: dict,
+    ) -> dict:
+        if alb_result.get("status") != "completed":
+            return {
+                "status": "skipped",
+                "reason": "ALB inventory was unavailable.",
+                "load_balancers": [],
+            }
+
+        load_balancers = alb_result.get("load_balancers", [])
+
+        if not load_balancers:
+            return {
+                "status": "skipped",
+                "reason": "No Application Load Balancers were found.",
+                "load_balancers": [],
+            }
+
+        try:
+            cloudwatch = self._cloudwatch()
+
+        except Exception as exc:
+            logger.exception(
+                "CloudWatch client initialization failed for ALB metrics"
+            )
+
+            return {
+                "status": "failed",
+                "reason": (
+                    f"CloudWatch initialization failed "
+                    f"({type(exc).__name__})."
+                ),
+                "load_balancers": [],
+            }
+
+        results = []
+
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(load_balancers)),
+            thread_name_prefix="cloudwatch-alb",
+        ) as executor:
+
+            futures = {
+                executor.submit(
+                    self._collect_cloudwatch_alb_instance,
+                    cloudwatch,
+                    load_balancer,
+                ): load_balancer.get("name", "unknown")
+                for load_balancer in load_balancers
+            }
+
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        results.sort(
+            key=lambda item: item["load_balancer_name"]
+        )
+
+        return {
+            "status": self._aggregate_status(results),
+            "load_balancers": results,
+        }
+
     def _check_health_parallel(self) -> dict:
-        # EC2, Kubernetes, and ALB investigations are independent.
+        # EC2, Kubernetes, and ALB discovery are independent.
         with ThreadPoolExecutor(
             max_workers=3,
             thread_name_prefix="devops-investigation",
@@ -301,9 +430,9 @@ class DevOpsAgent:
                 self._collect_alb_health,
             )
 
-            # Start CloudWatch after EC2 inventory is available.
             ec2_result = ec2_future.result()
 
+            # Collect EC2 CloudWatch metrics while other investigations run.
             if ec2_result["status"] == "completed":
                 cloudwatch_result = self._collect_cloudwatch_health(
                     ec2_result.get("instances", [])
@@ -318,6 +447,11 @@ class DevOpsAgent:
             kubernetes_result = kubernetes_future.result()
             alb_result = alb_future.result()
 
+        # ALB CloudWatch metrics require discovered ALB and target-group ARNs.
+        cloudwatch_alb_result = self._collect_cloudwatch_alb_health(
+            alb_result
+        )
+
         instances = ec2_result.get("instances", [])
         pods = kubernetes_result.get("pods", [])
 
@@ -329,9 +463,12 @@ class DevOpsAgent:
                 [],
             ),
             alb_health=alb_result,
+            cloudwatch_alb_metrics=cloudwatch_alb_result.get(
+                "load_balancers",
+                [],
+            ),
         )
 
-        # Empty inventories are not proof that infrastructure is healthy.
         if (
             ec2_result["status"] == "completed"
             and not instances
@@ -350,7 +487,12 @@ class DevOpsAgent:
 
         if cloudwatch_result["status"] in {"failed", "partial"}:
             diagnosis["evidence_gaps"].append(
-                "Some CloudWatch metrics could not be collected."
+                "Some EC2 CloudWatch metrics could not be collected completely."
+            )
+
+        if cloudwatch_alb_result["status"] in {"failed", "partial"}:
+            diagnosis["evidence_gaps"].append(
+                "Some ALB CloudWatch metrics could not be collected completely."
             )
 
         diagnosis["evidence_gaps"] = list(
@@ -367,23 +509,33 @@ class DevOpsAgent:
                 "infrastructure evidence is incomplete."
             )
 
-        investigation_statuses = [
+        primary_statuses = [
             ec2_result["status"],
             kubernetes_result["status"],
             alb_result["status"],
         ]
 
-        successful_investigations = sum(
+        successful_primary = sum(
             status == "completed"
-            for status in investigation_statuses
+            for status in primary_statuses
         )
 
-        if successful_investigations == 0:
+        cloudwatch_statuses = [
+            cloudwatch_result["status"],
+            cloudwatch_alb_result["status"],
+        ]
+
+        cloudwatch_complete = all(
+            status in {"completed", "skipped"}
+            for status in cloudwatch_statuses
+        )
+
+        if successful_primary == 0:
             execution_status = "failed"
 
         elif (
-            successful_investigations == len(investigation_statuses)
-            and cloudwatch_result["status"] in {"completed", "skipped"}
+            successful_primary == len(primary_statuses)
+            and cloudwatch_complete
         ):
             execution_status = "completed"
 
@@ -430,12 +582,18 @@ class DevOpsAgent:
                     "action": "inspect_load_balancers",
                     "status": alb_result["status"],
                 },
+                {
+                    "tool": "cloudwatch",
+                    "action": "get_alb_metrics",
+                    "status": cloudwatch_alb_result["status"],
+                },
             ],
             "output": {
                 "ec2": ec2_result,
                 "kubernetes": kubernetes_result,
                 "cloudwatch": cloudwatch_result,
                 "alb": alb_result,
+                "cloudwatch_alb": cloudwatch_alb_result,
                 "diagnosis": diagnosis,
             },
         }

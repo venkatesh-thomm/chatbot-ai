@@ -1,4 +1,41 @@
+
 class DevOpsAnalyzer:
+
+    @staticmethod
+    def _extract_metric_values(
+        metric_data: dict,
+        statistic: str,
+        metric_label: str,
+        evidence_gaps: list[str],
+    ) -> list[float]:
+        if not isinstance(metric_data, dict):
+            evidence_gaps.append(
+                f"CloudWatch metric {metric_label} was not returned."
+            )
+            return []
+
+        status_code = metric_data.get("status_code")
+
+        if status_code and status_code != "Complete":
+            evidence_gaps.append(
+                f"CloudWatch metric {metric_label} returned "
+                f"status {status_code}."
+            )
+
+        datapoints = metric_data.get("datapoints", [])
+
+        values = [
+            point[statistic]
+            for point in datapoints
+            if point.get(statistic) is not None
+        ]
+
+        if not values:
+            evidence_gaps.append(
+                f"No CloudWatch datapoints were available for {metric_label}."
+            )
+
+        return values
 
     def analyze_runtime_health(
         self,
@@ -7,6 +44,7 @@ class DevOpsAnalyzer:
         pods: list[dict] | None = None,
         cloudwatch_metrics: list[dict] | None = None,
         alb_health: dict | None = None,
+        cloudwatch_alb_metrics: list[dict] | None = None,
     ) -> dict:
         observations = []
         possible_causes = []
@@ -138,28 +176,43 @@ class DevOpsAnalyzer:
         # CloudWatch EC2 metrics
         for item in cloudwatch_metrics or []:
             instance_id = item.get("instance_id", "unknown")
+            item_status = item.get("status")
 
-            if item.get("status") != "completed":
+            if item_status not in {"completed", "partial"}:
                 evidence_gaps.append(
-                    f"CloudWatch metrics unavailable for {instance_id}."
+                    f"CloudWatch metrics unavailable for EC2 {instance_id}."
                 )
                 continue
 
+            if item_status == "partial":
+                evidence_gaps.append(
+                    f"CloudWatch EC2 metrics are partially available "
+                    f"for {instance_id}."
+                )
+
             metrics = item.get("metrics", {})
-            has_datapoints = False
-
-            cpu_points = metrics.get(
-                "CPUUtilization", {}
-            ).get("datapoints", [])
-
-            cpu_values = [
-                point["maximum"]
-                for point in cpu_points
-                if point.get("maximum") is not None
+            metric_definitions = [
+                ("CPUUtilization", "maximum"),
+                ("StatusCheckFailed", "maximum"),
+                ("StatusCheckFailed_Instance", "maximum"),
+                ("StatusCheckFailed_System", "maximum"),
             ]
 
+            instance_values = {}
+
+            for metric_name, statistic in metric_definitions:
+                values = self._extract_metric_values(
+                    metric_data=metrics.get(metric_name, {}),
+                    statistic=statistic,
+                    metric_label=f"EC2 {instance_id} {metric_name}",
+                    evidence_gaps=evidence_gaps,
+                )
+
+                instance_values[metric_name] = values
+
+            cpu_values = instance_values["CPUUtilization"]
+
             if cpu_values:
-                has_datapoints = True
                 maximum_cpu = max(cpu_values)
 
                 if maximum_cpu >= 80:
@@ -173,33 +226,17 @@ class DevOpsAnalyzer:
                         "Investigate workload and application resource consumption."
                     )
 
-            status_metrics = [
+            for metric_name in (
                 "StatusCheckFailed",
                 "StatusCheckFailed_Instance",
                 "StatusCheckFailed_System",
-            ]
+            ):
+                values = instance_values[metric_name]
 
-            for metric_name in status_metrics:
-                points = metrics.get(
-                    metric_name, {}
-                ).get("datapoints", [])
-
-                values = [
-                    point["maximum"]
-                    for point in points
-                    if point.get("maximum") is not None
-                ]
-
-                if not values:
-                    continue
-
-                has_datapoints = True
-                maximum = max(values)
-
-                if maximum > 0:
+                if values and max(values) > 0:
                     observations.append(
                         f"EC2 {instance_id}: {metric_name} "
-                        f"reached {maximum}."
+                        f"reached {max(values)}."
                     )
 
                     possible_causes.append(
@@ -207,12 +244,7 @@ class DevOpsAnalyzer:
                         "Investigate EC2 status-check details."
                     )
 
-            if not has_datapoints:
-                evidence_gaps.append(
-                    f"No CloudWatch datapoints were available for {instance_id}."
-                )
-
-        # Application Load Balancer and target health
+        # Application Load Balancer discovery and target health
         if alb_health is not None:
             alb_status = alb_health.get("status")
 
@@ -358,7 +390,169 @@ class DevOpsAnalyzer:
                                     f"(state: {target_state})."
                                 )
 
+        # CloudWatch Application Load Balancer metrics
+        for item in cloudwatch_alb_metrics or []:
+            lb_name = item.get(
+                "load_balancer_name",
+                "unknown",
+            )
+            item_status = item.get("status")
+
+            if item_status not in {"completed", "partial"}:
+                evidence_gaps.append(
+                    f"CloudWatch ALB metrics unavailable for {lb_name}."
+                )
+                continue
+
+            if item_status == "partial":
+                evidence_gaps.append(
+                    f"CloudWatch ALB metrics are partially available "
+                    f"for {lb_name}."
+                )
+
+            # Load-balancer-level metrics
+            lb_metrics = item.get(
+                "load_balancer_metrics",
+                {},
+            )
+
+            elb_5xx = self._extract_metric_values(
+                metric_data=lb_metrics.get(
+                    "HTTPCode_ELB_5XX_Count",
+                    {},
+                ),
+                statistic="sum",
+                metric_label=f"ALB {lb_name} HTTPCode_ELB_5XX_Count",
+                evidence_gaps=evidence_gaps,
+            )
+
+            if elb_5xx and sum(elb_5xx) > 0:
+                total_errors = sum(elb_5xx)
+
+                observations.append(
+                    f"ALB {lb_name} generated {total_errors} "
+                    "HTTP 5XX errors during the observation period."
+                )
+
+                possible_causes.append(
+                    f"ALB {lb_name} reported load-balancer-generated "
+                    "5XX errors. Investigate listener rules, load-balancer "
+                    "capacity, and backend connectivity."
+                )
+
+            # Target-group-level metrics
+            for target_group in item.get(
+                "target_group_metrics",
+                [],
+            ):
+                target_group_name = target_group.get(
+                    "target_group_name",
+                    "unknown",
+                )
+
+                metrics = target_group.get("metrics", {})
+
+                target_5xx = self._extract_metric_values(
+                    metric_data=metrics.get(
+                        "HTTPCode_Target_5XX_Count",
+                        {},
+                    ),
+                    statistic="sum",
+                    metric_label=(
+                        f"Target group {target_group_name} "
+                        "HTTPCode_Target_5XX_Count"
+                    ),
+                    evidence_gaps=evidence_gaps,
+                )
+
+                if target_5xx and sum(target_5xx) > 0:
+                    total_errors = sum(target_5xx)
+
+                    observations.append(
+                        f"Target group {target_group_name} generated "
+                        f"{total_errors} backend HTTP 5XX errors."
+                    )
+
+                    possible_causes.append(
+                        f"Target group {target_group_name} reported "
+                        "backend 5XX errors. Investigate application logs, "
+                        "dependencies, and backend request handling."
+                    )
+
+                response_times = self._extract_metric_values(
+                    metric_data=metrics.get(
+                        "TargetResponseTime",
+                        {},
+                    ),
+                    statistic="average",
+                    metric_label=(
+                        f"Target group {target_group_name} TargetResponseTime"
+                    ),
+                    evidence_gaps=evidence_gaps,
+                )
+
+                if response_times and max(response_times) > 1:
+                    observations.append(
+                        f"Target group {target_group_name} average "
+                        f"response time reached {max(response_times)} seconds."
+                    )
+
+                    possible_causes.append(
+                        f"Target group {target_group_name} has elevated "
+                        "backend response latency. Investigate application "
+                        "performance and downstream dependencies."
+                    )
+
+                healthy_hosts = self._extract_metric_values(
+                    metric_data=metrics.get(
+                        "HealthyHostCount",
+                        {},
+                    ),
+                    statistic="minimum",
+                    metric_label=(
+                        f"Target group {target_group_name} HealthyHostCount"
+                    ),
+                    evidence_gaps=evidence_gaps,
+                )
+
+                if healthy_hosts and min(healthy_hosts) == 0:
+                    observations.append(
+                        f"Target group {target_group_name} had zero "
+                        "healthy targets during the observation period."
+                    )
+
+                    possible_causes.append(
+                        f"Target group {target_group_name} had no healthy "
+                        "targets at one or more measurement intervals."
+                    )
+
+                unhealthy_hosts = self._extract_metric_values(
+                    metric_data=metrics.get(
+                        "UnHealthyHostCount",
+                        {},
+                    ),
+                    statistic="maximum",
+                    metric_label=(
+                        f"Target group {target_group_name} UnHealthyHostCount"
+                    ),
+                    evidence_gaps=evidence_gaps,
+                )
+
+                if unhealthy_hosts and max(unhealthy_hosts) > 0:
+                    observations.append(
+                        f"Target group {target_group_name} unhealthy "
+                        f"host count reached {max(unhealthy_hosts)}."
+                    )
+
+                    possible_causes.append(
+                        f"Target group {target_group_name} has unhealthy "
+                        "targets. Review target-health reasons and health checks."
+                    )
+
         # Overall diagnosis
+        evidence_gaps = list(dict.fromkeys(evidence_gaps))
+        possible_causes = list(dict.fromkeys(possible_causes))
+
         if observations:
             status = "issues_detected"
             conclusion = (
@@ -376,8 +570,9 @@ class DevOpsAnalyzer:
         else:
             status = "healthy"
             conclusion = (
-                "No unhealthy EC2, Kubernetes Pod, or ALB target signals "
-                "were found in the inspected resources at check time."
+                "No unhealthy EC2, Kubernetes Pod, ALB target, or "
+                "CloudWatch ALB metric signals were found in the inspected "
+                "resources at check time."
             )
 
         return {
@@ -385,11 +580,11 @@ class DevOpsAnalyzer:
             "conclusion": conclusion,
             "checked_resource_count": checked_resources,
             "observations": observations,
-            "possible_causes": list(dict.fromkeys(possible_causes)),
-            "evidence_gaps": list(dict.fromkeys(evidence_gaps)),
+            "possible_causes": possible_causes,
+            "evidence_gaps": evidence_gaps,
         }
 
-    # Retained for existing ALB and CloudWatch findings analysis.
+    # Retained for existing findings analysis.
     def _metric_values(self, metric_data: dict) -> list:
         return metric_data.get("datapoints", [])
 
